@@ -1,0 +1,11 @@
+.git
+.venv
+.venv-claude
+__pycache__
+*.pyc
+cache/
+data/
+*.csv
+*.parquet
+*.pt
+logs/

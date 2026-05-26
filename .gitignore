@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.venv/
+.venv-claude/
+venv/
+env/
+
+# data / cache / outputs — никогда не комитим
+cache/
+data/
+logs/
+*.csv
+*.parquet
+*.pt
+*.npz
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
