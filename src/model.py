@@ -229,3 +229,34 @@ class TwoTower(nn.Module):
                    mask: torch.Tensor) -> torch.Tensor:
         item_seq = self.item.lookup(hist_feats)
         return self.user(item_seq, hist_eids, mask)
+
+
+def gather_feats(feat_lut: dict, idx: torch.Tensor) -> dict:
+    """
+    Утилита: для тензора item_idx'ов возвращает словарь с фичами,
+    готовый к передаче в `ItemTower`.
+
+    `feat_lut` — словарь 1D-тензоров длины n_items (полные таблицы фич
+    каталога):
+        {"vert": (n_items,), "cat": (n_items,), ..., "pop": (n_items,)}.
+
+    `idx` — тензор индексов любой формы (одномерный батч негативов,
+    двумерная (B, H) история и т.п.).  Каждое значение в результирующем
+    словаре имеет ту же форму, что `idx` (т.е. shape(out["vert"]) ==
+    shape(idx)) — fancy-indexing PyTorch.
+
+    Этот хелпер используется и в train_model (при сэмплировании
+    позитивов/негативов), и в predict_model (при кодировании каталога),
+    чтобы держать единственный источник истины для формата фич.
+    """
+    return {
+        "vert": feat_lut["vert"][idx],
+        "cat":  feat_lut["cat" ][idx],
+        "reg":  feat_lut["reg" ][idx],
+        "loc":  feat_lut["loc" ][idx],
+        "s0":   feat_lut["s0"  ][idx],
+        "s1":   feat_lut["s1"  ][idx],
+        "s2":   feat_lut["s2"  ][idx],
+        "s3":   feat_lut["s3"  ][idx],
+        "pop":  feat_lut["pop" ][idx],
+    }

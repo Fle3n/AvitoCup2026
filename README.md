@@ -13,14 +13,58 @@ retrieval-сигнал — это скалярное произведение `u
 
 ## Соответствие правилам номинации
 
-| Требование                                                | Где реализовано                       |
-| --------------------------------------------------------- | ------------------------------------- |
-| ✅ Только нейросеть                                       | `src/model.py` (TwoTower)             |
-| ✅ Воспроизводимо                                         | Фиксированный seed=42, версии в `requirements.txt` |
-| ✅ Dockerfile для запуска                                 | [`Dockerfile`](Dockerfile)            |
-| ✅ `python train.py` → артефакт модели                    | [`train.py`](train.py) → `model.pt`   |
-| ✅ `python predict.py` → submission.csv                   | [`predict.py`](predict.py) → `submission.csv` |
-| ✅ Формат submission'а соответствует соревнованию          | `user_id, item_id`, ≤ 160 на юзера, уникальные пары |
+| Требование из [`Номинация.txt`](https://t.me/avito_cup)        | Где / как выполнено                                  |
+| -------------------------------------------------------------- | ---------------------------------------------------- |
+| ✅ В решении используются ТОЛЬКО нейросети                     | [`src/model.py`](src/model.py) (TwoTower) + см. ниже «Где границы end-to-end NN» |
+| ✅ Решение выложено на GitHub                                  | Этот репозиторий                                     |
+| ✅ Решение воспроизводимо                                      | seed=42 везде, версии в [`requirements.txt`](requirements.txt) и [`Dockerfile`](Dockerfile) (cu128 / Blackwell) |
+| ✅ Dockerfile для запуска                                      | [`Dockerfile`](Dockerfile)                           |
+| ✅ Скрипт отдаёт `submission.csv` в формате соревнования       | [`predict.py`](predict.py) → колонки `user_id, item_id`, ≤ 160 на пользователя, уникальные пары |
+| ✅ `python train.py` → артефакт модели                         | [`train.py`](train.py) → `$AVITO_CACHE/model.pt`     |
+| ✅ `python predict.py` → submission.csv                        | [`predict.py`](predict.py) → `$AVITO_OUT`            |
+
+### Где границы end-to-end NN
+
+Чтобы не было неоднозначности при ручной проверке — вот что в нашем
+пайплайне является нейросетью, а что нет:
+
+| Компонент                                | NN?  | Откуда берётся                                       |
+| ---------------------------------------- | ---- | ---------------------------------------------------- |
+| `item_emb` (вектора всех объявлений)     | ✅   | Прямой forward через обученную ItemTower             |
+| `user_emb` (вектора eval-юзеров)         | ✅   | Σ recency × contact_bonus × **NN item_emb**          |
+| score = dot product                      | ✅   | Скалярное произведение обученных NN-эмбеддингов      |
+| BM25 нормализация по популярности        | ❌   | Детерминированная формула на `n_users` колонке vocab |
+| vertical/region bonuses                  | ❌   | Детерминированное правило (top-вертикаль юзера)      |
+| novelty mask (выкидываем seen items)     | ❌   | Детерминированный фильтр по истории                  |
+
+Все «не-NN» компоненты — это **детерминированный пост-процессинг над
+NN-скорами**, аналогичный тому, что делает любой production search/recsys
+поверх dot-product retrieval'а.  Никаких обучаемых моделей кроме TwoTower
+в пайплайне нет.
+
+---
+
+## Метрика и формат submission'а
+
+* **Recall@160** = среднее по пользователям отношения
+  `|prediction ∩ targets| / |targets|`.  Эталонная реализация —
+  [`src/calc_metric.py`](src/calc_metric.py).
+* **`submission.csv`** содержит колонки `user_id, item_id`, не более
+  160 строк на пользователя, все пары уникальные.
+
+Пример первых строк submission.csv:
+
+```csv
+user_id,item_id
+30,114289691
+30,19543419
+30,153291894
+30,89211239
+...
+33,120023046
+33,3126767
+...
+```
 
 ---
 
@@ -99,26 +143,67 @@ docker run --gpus all \
     avito-nn bash -lc "python train.py && python predict.py"
 ```
 
-Ожидаемое полное время прохождения на одной RTX 5090 / 32 ГБ —
-**около 45 минут**:
+### Время выполнения
+
+Замерено на нашем основном dev-стенде:
+
+| Стенд                                | train.py | predict.py | итого    |
+| ------------------------------------ | -------- | ---------- | -------- |
+| **1× RTX 5090 32 ГБ + 503 ГБ RAM**   | ~25 мин  | ~25 мин    | **~50 мин** |
+| 1× RTX 4090 24 ГБ + 256 ГБ RAM (оценка)¹ | ~30 мин  | ~50 мин²   | ~80 мин   |
+| 1× A100 80 ГБ + 256 ГБ RAM (оценка)¹  | ~25 мин  | ~25 мин    | ~50 мин   |
+
+¹ Не запускали лично — оценки по соотношению TFLOPS и VRAM.
+² На 24 ГБ VRAM `item_emb` (28.75 ГБ fp16) не помещается; нужно перейти
+на `d=64` модель (`train.py --d 64`, ожидаемый recall ~0.029) или
+скорить чанками с CPU-staging — в этом случае predict в 2× медленнее.
+
+#### Подробная разбивка train.py на RTX 5090
 
 | Шаг                  | Время    | Что делает                                  |
 | -------------------- | -------- | ------------------------------------------- |
-| `build_vocab`        | ~5 мин   | scan событий, фильтр vertical/pop          |
-| `build_user_seq`     | ~5 мин   | поартиционно собирает per-user истории     |
-| `train_model`        | ~15 мин  | 3 эпохи AdamW + bf16                       |
-| `predict_model`      | ~20 мин  | encode items + score 95k users × 120M items |
+| `build_vocab`        | ~5 мин   | scan событий, фильтр по вертикалям/min-pop  |
+| `build_user_seq`     | ~3 мин   | поартиционно собирает per-user истории      |
+| `train_model`        | ~17 мин  | 3 эпохи AdamW + bf16, ~12 k шагов           |
 
-Раскладка данных, которую ожидает контейнер (`$AVITO_DATA`):
+#### Подробная разбивка predict.py на RTX 5090
+
+| Шаг                  | Время    | Что делает                                    |
+| -------------------- | -------- | --------------------------------------------- |
+| load model + alloc   | ~2 сек   | 28.75 ГБ item_emb на GPU                      |
+| encode catalog       | ~4 сек   | 120 M items через ItemTower (30 M items/sec)  |
+| scan user history    | ~3 мин   | scan train_data + eval_user_events (Polars)   |
+| build per-user stats | ~30 сек  | recency-weighted веса, top-vert, top-reg      |
+| scoring (≈90 k user) | ~20 мин  | streaming 32-user batches × 2 M item chunks   |
+
+### Раскладка данных, которую ожидает контейнер
+
+`$AVITO_DATA` (по умолчанию `/data`):
 
 ```
 data/
 ├── train_data/part_NNN.parquet     # 100 партиций по user_id % 100, ~6×10⁹ событий
 ├── eval_user_events.pq             # история eval-юзеров
-├── eval_users.csv                  # список user_id для предсказания
-├── item_features.parquet           # метаданные объявлений
-├── contact_eids.csv                # какие eid считаются контактом
+├── eval_users.csv                  # 1 колонка: user_id (≈ 95 k строк)
+├── item_features.parquet           # метаданные 178 M объявлений
+├── contact_eids.csv                # колонка mapped_eid: какие eid = "контакт"
 └── prepare_local_eval.py           # (опц.) официальный скрипт synth-split
+```
+
+Колонки в `train_data/part_*.parquet` (релевантные):
+
+```
+user_id   UInt32   — кто
+item_id   UInt32   — что
+timestamp Int64    — UTC ms
+eid       UInt32   — тип события (просмотр / контакт / ...)
+```
+
+Колонки в `item_features.parquet` (используемые):
+
+```
+item_id, vertical_id, category_ext_y, region_id_y, loc_id_y,
+sid_0_y, sid_1_y, sid_2_y, sid_3_y
 ```
 
 ---
@@ -160,7 +245,7 @@ python validate.py score
 ├── README.md
 └── src/
     ├── __init__.py
-    ├── model.py                # ItemTower, UserTower, TwoTower
+    ├── model.py                # ItemTower, UserTower, TwoTower, gather_feats
     ├── build_vocab.py          # стадия train-1: словарь объявлений + dims
     ├── build_user_seq.py       # стадия train-2: per-user истории
     ├── train_model.py          # стадия train-3: обучение TwoTower
@@ -189,7 +274,8 @@ python validate.py score
 * **Векторизованный contact-position sampler.**  Первая версия с
   python-циклом тащила обучение на 1.5 step/s; переписали через
   `numpy.repeat` + `numpy.diff` + broadcasting → 25 step/s.  GPU
-  становится узким местом.
+  становится узким местом (см. ASCII-пример в docstring'е
+  `TrainingData.sample_batch`).
 
 * **Чанковый retrieval.**  95 k user × 120 M item × fp16 logits = 22 TiB.
   Мы скорим user-batches (32 user) против item-chunks (2 M item),

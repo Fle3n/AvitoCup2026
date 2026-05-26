@@ -53,7 +53,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
 
-from .model import TwoTower
+from .model import TwoTower, gather_feats
 
 
 DATA  = os.environ.get("AVITO_DATA",  "/data")
@@ -211,6 +211,36 @@ class TrainingData:
 
         Историю переворачиваем (oldest=0, newest=H-1) — Transformer'у
         удобнее последовательность хронологически "слева направо".
+
+        ─── Пример ───────────────────────────────────────────────────────
+        У юзера всего 5 событий с eid'ами:  [view, view, CONTACT, view, CONTACT]
+        и item_idx'ами:                      [  a ,   b ,    c   ,  d ,    e   ]
+        (CONTACT — это то, что считается positive для обучения.)
+
+        В contact_pos для этого юзера будут две позиции: index=2 (c) и
+        index=4 (e), потому что на них был контакт И index >= 1
+        (есть как минимум 1 событие до).
+
+        Если sampler выбрал позицию index=4 (target=e) при H=3:
+            target_global    = offsets[u] + 4
+            k_back           = [1, 2, 3]
+            positions        = target_global - [1, 2, 3]  → d, c, b
+            hist_rev         = [d, c, b]   (от свежего к старому)
+            hist (после ::-1)= [b, c, d]   (от старого к свежему)
+            eids             = [view, CONTACT, view]
+            mask             = [1, 1, 1]   (все позиции валидны)
+            target           = e
+
+        Если sampler выбрал index=2 (target=c) при H=3, то столбцов
+        истории всего 2 (b, a), и в первой позиции (oldest) будет
+        padding:
+            positions        = [1, 0, -1]   → b, a, <invalid>
+            valid            = [1, 1, 0]    (поэлементно position >= 0)
+            hist (clipped)   = [<pad>, a, b]
+            mask             = [0, 1, 1]
+
+        Маска нужна attention'у в UserTower, чтобы он игнорировал pad.
+        ────────────────────────────────────────────────────────────────
         """
         H = self.max_hist
         idx = rng.integers(0, len(self.contact_pos), size=B)
@@ -307,19 +337,13 @@ def train(args):
         floor = args.lr / 50.0
         return floor + (args.lr - floor) * cosine
 
-    def feats_dict(idx_t: torch.Tensor) -> dict:
-        """Удобный shorthand для модельного словаря фич."""
-        return {
-            "vert": td.feat_vert[idx_t],
-            "cat":  td.feat_cat [idx_t],
-            "reg":  td.feat_reg [idx_t],
-            "loc":  td.feat_loc [idx_t],
-            "s0":   td.feat_s0 [idx_t],
-            "s1":   td.feat_s1 [idx_t],
-            "s2":   td.feat_s2 [idx_t],
-            "s3":   td.feat_s3 [idx_t],
-            "pop":  td.feat_pop[idx_t],
-        }
+    # Lookup-словарь для `gather_feats` — один источник истины для формата
+    # фич, шарится с predict_model через `src.model.gather_feats`.
+    feat_lut = {
+        "vert": td.feat_vert, "cat": td.feat_cat, "reg": td.feat_reg,
+        "loc":  td.feat_loc,  "s0":  td.feat_s0,  "s1":  td.feat_s1,
+        "s2":   td.feat_s2,   "s3":  td.feat_s3,  "pop": td.feat_pop,
+    }
 
     step = 0
     for epoch in range(args.epochs):
@@ -335,9 +359,9 @@ def train(args):
             target    = target.to(device, non_blocking=True)
             negs      = negs.to(device, non_blocking=True)
 
-            hist_feats   = feats_dict(hist)
-            target_feats = feats_dict(target)
-            negs_feats   = feats_dict(negs)
+            hist_feats   = gather_feats(feat_lut, hist)
+            target_feats = gather_feats(feat_lut, target)
+            negs_feats   = gather_feats(feat_lut, negs)
 
             for g in opt.param_groups:
                 g["lr"] = lr_at(step)
